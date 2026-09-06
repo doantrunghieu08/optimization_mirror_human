@@ -1,0 +1,66 @@
+experiment_name: "mirror_belief_refit"
+
+data:
+  real_dir:    "inputs/real/hmr4d_results_p0.pt"   # Dir containing hmr4d_results.pt for real person
+  mirror_dir:  "inputs/mirror/hmr4d_results_p1.pt" # Dir containing hmr4d_results.pt for mirror
+  gt_dir:      null                         # Không có GT; pipeline chạy self-supervised
+  image_width: 1920
+  frame_rate: 30.0                            # Temporal loss calibration; match the source video FPS
+  beta_mode: "per_frame"
+  beta_source: "real"                        # Keep the input shape while refining pose
+  mirror_intrinsics_mode: "raw"              # "raw" hoặc "flipped" — xem dataloaders/dataset.py
+
+model:
+  smpl_model_path: "models/SMPLX_NEUTRAL.npz"  # GVHMR predicts SMPL-X parameters
+
+# ── Ray-casting occlusion + Belief theory (Dempster-Shafer) + SMPLify-style
+#    iterative refit — xem HuongTiepCanMoi.md và utils/pose_refit.py ─────────
+refit:
+  outer_iterations:    3       # Các lượt tối ưu với prior warm-up; evidence nguồn được giữ cố định
+  inner_steps:         150     # Số bước Adam mỗi vòng ngoài
+  lr:                  0.01    # Giảm từ 0.02 — bước Adam mịn hơn, tránh xoay quá đà 1 step (Bug 6)
+  reproj_sigma:        50.0    # Ngưỡng chịu đựng sai số reprojection (px), dùng cho cả loss lẫn b_reproj
+  belief_combine:      "dempster_shafer"  # "dempster_shafer" hoặc "weighted"
+  convergence_deg:     0.5     # Dừng sớm nếu pose thay đổi < ngưỡng này (độ) giữa 2 vòng ngoài
+  occlusion_near_eps:  0.02    # (m) bỏ qua giao điểm ray-mesh quá gần camera
+  occlusion_far_ratio: 0.985   # bỏ qua giao điểm ray-mesh quá gần chính joint (tự cắt bề mặt da)
+  post_smooth: false          # Temporal losses already run inside the refit objective
+  preserve_real_projection: true  # Reject frames that worsen detector-weighted 2D error
+
+  loss_weights:
+    w_reproj_real:     1.0
+    w_reproj_mirror:   1.0
+    w_pose_prior:      0.6    # Phạt tư thế cực đoan (giá trị đỉnh — warm-up tăng dần từ w_pose_prior_min)
+    w_pose_prior_min:  0.25   # Giá trị khởi điểm ở outer loop đầu — tránh siết quá sớm, kẹt local minimum
+    w_joint_angle_limit: 1.5  # Phạt góc xoay TỔNG HỢP vượt ROM sinh lý tối đa (AAOS): Hip 120°, Spine 30°/đốt, Shoulder 180°, Elbow 150°, Wrist 90°
+    w_pose_accel:      2.0    # Phạt GIA TỐC xoay (đổi hướng vận tốc đột ngột) — chống rung giật/jerk
+    w_anatomical:      1.5    # Bảo vệ đầu gối không bẻ ngược
+    w_elbow:           1.2    # Bảo vệ khuỷu tay không bẻ ngược (gập chính trên trục Z)
+    w_head_collision:  1.0    # Chống xuyên qua đầu (cổ tay cách đầu > 20cm)
+    w_symmetry:        0.5    # Đối xứng xương trái/phải
+    w_bone_stability:  0.5    # Chiều dài xương ổn định qua frame
+    w_temporal:        1.0    # Làm mượt gia tốc VỊ TRÍ 3D khớp giữa các frame
+    w_pose_temporal:   3.0    # Làm mượt vận tốc XOAY (axis-angle) — chống khung xương "nhảy nhót"
+    temporal_confidence_min_weight: 0.3  # Sàn gate [0,1] cho w_pose_temporal/w_pose_accel: khớp/frame được real HOẶC mirror xác nhận belief cao sẽ bị giảm phạt vận tốc/gia tốc xuống tối thiểu còn giá trị này (0=tắt hẳn, 1=không giảm) — giữ lại 50% phạt để tránh pose đổi quá gắt
+    w_penetration:     0.25   # Skeleton-distance proxy: keep weaker than measured 2D evidence
+    w_anchor:          0.30   # Body neo về pose belief-fused; root neo về real camera
+    # ── Grotesque Pose Penalties ──────────────────────────────────────────────
+    w_spine_twist:   2.5    # Phạt xoắn cột sống (Spine max 15°/đốt, tổng 3 đốt < 25°) — chống vặn người
+    w_hip_split:     1.0    # Phạt dạng háng > 90° (tư thế xoạc)
+    w_leg_crossing:  3.0    # Phạt vắt chân / chéo chân quá đường trung tâm
+    w_hip_adduction: 2.0    # Phạt khép háng > 25°
+    w_shoulder_hyper: 1.0   # Phạt vai bẻ ngược > 180° (giới hạn sinh lý tối đa flexion/abduction)
+    w_wrist_bend:    0.8    # Phạt cổ tay bẻ > 90° (gãy cổ tay)
+    penetration_radius:    0.10
+    penetration_sharpness: 30.0
+    grad_clip_go:          0.5   # Clip riêng cho opt_go (3 chiều) — tránh bị opt_bp (63 chiều) lấn át (Bug 6)
+    grad_clip_bp:          1.0   # Clip riêng cho opt_bp
+
+visualization:
+  input_video:      "inputs/0_input_video.mp4"
+  output_dir:       "output"                    # Thư mục chứa inference_results.pkl và video
+  output_video:     "output/fused_output.mp4"
+  max_frames:       -1
+  # Tắt correction khi so baseline MPJPE. Bật lại chỉ sau ablation riêng.
+  beta0_correction: 0.0
+  beta1_correction: 0.0

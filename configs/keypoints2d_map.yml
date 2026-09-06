@@ -1,0 +1,23 @@
+# joints_map: Mảng chứa index các khớp của 2D Keypoints (từ ViTPose - định dạng COCO 17 joints)
+# Vì ViTPose đã trả về đúng 17 khớp theo thứ tự chuẩn COCO nên index map trực tiếp từ 0 đến 16.
+joints_map: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+# target_joints: Tên 17 khớp chuẩn COCO (tương ứng với kết quả ViTPose)
+target_joints:
+  - nose
+  - left_eye
+  - right_eye
+  - left_ear
+  - right_ear
+  - left_shoulder
+  - right_shoulder
+  - left_elbow
+  - right_elbow
+  - left_wrist
+  - right_wrist
+  - left_hip
+  - right_hip
+  - left_knee
+  - right_knee
+  - left_ankle
+  - right_ankle

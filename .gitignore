@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.runtime-deps/
+.venv/
+
+inputs/
+output/
+runs/
+
+# SMPL/SMPL-X assets are large and license-restricted; load them from Drive.
+models/*.pkl
+models/*.npz
+models/*.pt

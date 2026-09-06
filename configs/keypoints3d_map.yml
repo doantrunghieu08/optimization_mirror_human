@@ -1,0 +1,25 @@
+# Legacy SMPL only. The SMPL-X/GVHMR pipeline uses the surface regressor
+# models/smplx_coco17_J_regressor.pt; these anatomical indices do not apply to it.
+# joints_map: Mảng chứa index các khớp của mô hình SMPL (45 joints từ smplx) 
+# để map chuẩn về 17 khớp định dạng COCO của ViTPose
+joints_map: [24, 26, 25, 28, 27, 16, 17, 18, 19, 20, 21, 1, 2, 4, 5, 7, 8]
+
+# target_joints: Tên 17 khớp chuẩn COCO (tương ứng với kết quả ViTPose)
+target_joints:
+  - nose
+  - left_eye
+  - right_eye
+  - left_ear
+  - right_ear
+  - left_shoulder
+  - right_shoulder
+  - left_elbow
+  - right_elbow
+  - left_wrist
+  - right_wrist
+  - left_hip
+  - right_hip
+  - left_knee
+  - right_knee
+  - left_ankle
+  - right_ankle

@@ -1,0 +1,125 @@
+"""
+mesh_raycast.py — Phát hiện self-occlusion bằng ray-casting trên mesh SMPL.
+
+Ý tưởng (xem HuongTiepCanMoi.md, mục 1):
+    Với mỗi joint, bắn một tia (ray) từ tâm camera tới vị trí 3D của joint đó.
+    Nếu tia này bị một mặt (face) khác của mesh cắt ngang TRƯỚC khi tới joint,
+    joint được coi là bị che khuất bởi chính cơ thể (self-occlusion).
+
+Quy ước hệ tọa độ:
+    Cả view "real" và view "mirror" trong pipeline này đều đến từ hai lần chạy
+    HMR4D độc lập (một lần trên ảnh thật, một lần trên ảnh phản chiếu qua
+    gương). Mỗi lần chạy trả về pose ở dạng "incam": tâm camera nằm ở gốc tọa
+    độ (0, 0, 0) và toàn bộ mesh/joints nằm ở phía dương trục Z. Vì vậy KHÔNG
+    cần dựng "virtual camera" bằng ma trận phản xạ Householder như mô tả ở
+    mục 2 của tài liệu — chỉ cần dựng mesh riêng cho mỗi view (bằng forward
+    kinematics với params của đúng view đó) rồi bắn tia từ gốc tọa độ.
+
+Dùng trimesh làm bộ tăng tốc ray–mesh intersection (không cần pyembree; nếu
+không có pyembree, trimesh tự dùng RayMeshIntersector thuần numpy — vẫn đủ
+nhanh vì mỗi frame chỉ cần bắn 17 tia).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+import trimesh
+
+
+def compute_ray_occlusion(
+    joints_3d: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    camera_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    near_eps: float = 0.02,
+    far_ratio: float = 0.985,
+) -> np.ndarray:
+    """
+    Ray-cast từ `camera_origin` tới từng joint trong `joints_3d` qua mesh (vertices, faces).
+
+    Một joint bị coi là occluded nếu tồn tại giao điểm ray–mesh nằm trong
+    khoảng (near_eps, far_ratio * khoảng_cách_tới_joint) — tức nằm TRƯỚC joint,
+    không tính các giao điểm nằm ngay sát bề mặt da quanh chính joint đó
+    (loại nhiễu "false positive" do mesh tự cắt chính bề mặt tại joint).
+
+    Args:
+        joints_3d     : (J, 3) tọa độ 3D các khớp, cùng hệ tọa độ với mesh.
+        vertices      : (V, 3) đỉnh mesh SMPL.
+        faces         : (F, 3) chỉ số mặt tam giác.
+        camera_origin : tâm quang học của camera (mặc định gốc tọa độ, quy ước "incam").
+        near_eps      : khoảng cách tối thiểu (m) trước khi tính là giao điểm hợp lệ.
+        far_ratio     : tỉ lệ khoảng cách tới joint — giao điểm xa hơn ngưỡng này
+                        (tức nằm ngay tại/gần bề mặt da của joint) bị bỏ qua.
+
+    Returns:
+        occluded : (J,) bool — True nếu joint bị self-occluded.
+    """
+    joints_3d = np.asarray(joints_3d, dtype=np.float64)
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    origin = np.asarray(camera_origin, dtype=np.float64)
+
+    J = joints_3d.shape[0]
+    occluded = np.zeros(J, dtype=bool)
+
+    directions = joints_3d - origin[None, :]
+    dists = np.linalg.norm(directions, axis=-1)
+    safe_dists = np.clip(dists, 1e-8, None)
+    unit_dirs = directions / safe_dists[:, None]
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    origins = np.repeat(origin[None, :], J, axis=0)
+
+    locations, index_ray, _ = mesh.ray.intersects_location(
+        origins, unit_dirs, multiple_hits=True
+    )
+    if len(locations) == 0:
+        return occluded
+
+    hit_dists = np.linalg.norm(locations - origin[None, :], axis=-1)
+    for ray_idx in np.unique(index_ray):
+        mask = index_ray == ray_idx
+        far_limit = dists[ray_idx] * far_ratio
+        valid_hit = (hit_dists[mask] > near_eps) & (hit_dists[mask] < far_limit)
+        if np.any(valid_hit):
+            occluded[ray_idx] = True
+
+    return occluded
+
+
+def compute_occlusion_belief_batch(
+    joints_3d: torch.Tensor,
+    vertices: torch.Tensor,
+    faces: np.ndarray | torch.Tensor,
+    camera_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    near_eps: float = 0.02,
+    far_ratio: float = 0.985,
+) -> torch.Tensor:
+    """
+    b_occ theo batch: 1.0 = visible (không bị che), 0.0 = self-occluded.
+
+    joints_3d : (B, J, 3), vertices : (B, V, 3) — mesh phải dựng từ CÙNG pose
+    (dùng torch.no_grad() phía gọi hàm — ray-casting không khả vi).
+    """
+    joints_np = joints_3d.detach().cpu().numpy()
+    verts_np = vertices.detach().cpu().numpy()
+    faces_np = faces.detach().cpu().numpy() if isinstance(faces, torch.Tensor) else np.asarray(faces)
+
+    B, J, _ = joints_np.shape
+    belief = np.ones((B, J), dtype=np.float32)
+    frame_range = range(B)
+    if B > 20:
+        try:
+            from tqdm import tqdm
+            frame_range = tqdm(frame_range, desc="ray-cast occlusion", leave=False)
+        except ImportError:
+            pass
+    for b in frame_range:
+        occluded = compute_ray_occlusion(
+            joints_np[b], verts_np[b], faces_np,
+            camera_origin=camera_origin, near_eps=near_eps, far_ratio=far_ratio,
+        )
+        belief[b] = 1.0 - occluded.astype(np.float32)
+
+    return torch.from_numpy(belief).to(device=joints_3d.device, dtype=joints_3d.dtype)
