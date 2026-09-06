@@ -1,3 +1,4 @@
+import inspect
 import json
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ import torch
 
 from dataloaders.dataset import flip_camera_intrinsics
 from evaluate import evaluate_3d_error
+from render_video import render_video
 from utils.belief_fusion import (
     combine_beliefs_dempster_shafer,
     compute_detection_belief,
@@ -281,6 +283,13 @@ class MeshRaycastRegressionTests(unittest.TestCase):
         joints = np.array([[5.0, 5.0, 6.0]])
         occluded = compute_ray_occlusion(joints, vertices, faces)
         self.assertFalse(bool(occluded[0]))
+
+
+class RenderResourceRegressionTests(unittest.TestCase):
+    def test_render_video_uses_one_offscreen_renderer(self):
+        source = inspect.getsource(render_video)
+        self.assertEqual(source.count("pyrender.OffscreenRenderer("), 1)
+        self.assertEqual(source.count("renderer.delete()"), 1)
 
 
 if __name__ == "__main__":

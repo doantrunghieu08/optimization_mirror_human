@@ -217,15 +217,12 @@ def render_video(config: dict, pkl_path: str, input_video: str, output_video: st
     print(f"Rendering {n_frames} frames -> {output_video}")
     label1 = "SMPL Mesh Overlay"
 
-    # Tái sử dụng 1 OffscreenRenderer cho mỗi panel xuyên suốt video thay vì
-    # khởi tạo/hủy OpenGL context mỗi frame (rất tốn — xem CODE_REVIEW.md M-01).
-    overlay_renderer = None
-    global_renderer = None
+    # Hai panel cùng kích thước nên dùng chung một EGL context.
+    renderer = None
     try:
         if PYRENDER_AVAILABLE:
             import pyrender
-            overlay_renderer = pyrender.OffscreenRenderer(viewport_width=width, viewport_height=height)
-            global_renderer = pyrender.OffscreenRenderer(viewport_width=width, viewport_height=height)
+            renderer = pyrender.OffscreenRenderer(viewport_width=width, viewport_height=height)
 
         for frame_idx in tqdm(range(n_frames)):
             # Đọc frame video gốc
@@ -250,7 +247,7 @@ def render_video(config: dict, pkl_path: str, input_video: str, output_video: st
             verts_global = verts_global_t[0].cpu().numpy()
 
             # ── Panel 1: Overlay SMPL mesh lên video gốc ─────────────────────────────
-            panel1 = _render_overlay_panel_mesh(frame=frame, vertices=verts_incam, faces=faces_np, K_np=K_np, renderer=overlay_renderer)
+            panel1 = _render_overlay_panel_mesh(frame=frame, vertices=verts_incam, faces=faces_np, K_np=K_np, renderer=renderer)
             cv2.putText(panel1, label1, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
             # ── Panel 2: Dual 2D projection (real + mirror) ───────────────────
@@ -286,17 +283,15 @@ def render_video(config: dict, pkl_path: str, input_video: str, output_video: st
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
             # ── Panel 3: SMPL mesh 3D global view ───────────────────────────
-            panel3 = _render_global_panel_mesh(verts_global, faces_np, height, width, fixed_target_height, renderer=global_renderer)
+            panel3 = _render_global_panel_mesh(verts_global, faces_np, height, width, fixed_target_height, renderer=renderer)
             cv2.putText(panel3, "3D Mesh Global View", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (30, 30, 30), 2)
 
             # ── Ghép và ghi frame ─────────────────────────────────────────
             combined = np.concatenate((panel1, panel2, panel3), axis=1)
             out.write(combined)
     finally:
-        if overlay_renderer is not None:
-            overlay_renderer.delete()
-        if global_renderer is not None:
-            global_renderer.delete()
+        if renderer is not None:
+            renderer.delete()
         cap.release()
         out.release()
     print(f"Video saved: {output_video}")
