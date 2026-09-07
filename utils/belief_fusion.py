@@ -1,22 +1,9 @@
-"""
-belief_fusion.py — Belief theory cho occlusion (xem HuongTiepCanMoi.md).
+"""Belief/reliability helpers for real and mirror observations.
 
-Ba nguồn evidence độc lập cho mỗi khớp, mỗi view (real / mirror):
-    b_occ    : ray-casting trên mesh SMPL (utils/mesh_raycast.py) — 1 nếu
-               không bị self-occluded, 0 nếu bị che khuất bởi chính cơ thể.
-               Đây là evidence "cứng" (nhị phân, không có vùng "uncertain").
-    b_det    : độ tin cậy 2D detector (ViTPose), trong [0, 1].
-    b_reproj : độ nhất quán khi reproject joint 3D hiện tại xuống ảnh so với
-               keypoint 2D detect được; residual càng nhỏ, belief càng cao.
-
-Kết hợp bằng Dempster–Shafer combination rule (mục 3 của tài liệu): mỗi
-nguồn được biểu diễn bằng khối lượng niềm tin (mass) trên khung nhận thức
-{Present, Absent, Uncertain}. b_occ có thể khẳng định "Absent" một cách chắc
-chắn (occluded → m(Absent) = 1), trong khi b_det/b_reproj chỉ có thể khẳng
-định "Present" hoặc "Uncertain" (không có bằng chứng trực tiếp phủ định).
-Nhờ vậy, khi ray-casting xác nhận occlusion, belief tổng bị kéo về 0 dù các
-nguồn khác (detector, reprojection) có tin cậy cao — đúng tinh thần "ray bị
-cắt bởi một phần khác của cơ thể → local-belief = 0" trong tài liệu.
+Optimizer reliability is b_det * b_reproj from the original observation.
+Joint-centre ray casting remains in b_occ diagnostics only because internal
+anatomical joints intersect the skin even when their 2D landmarks are visible.
+The older combination helpers remain callable for diagnostics and compatibility.
 
 Sau khi có belief theo khung khớp COCO-17 (17 khớp), belief được ánh xạ sang
 21 khớp body_pose SMPL (axis-angle) để dùng làm trọng số fusion SO(3)
@@ -486,8 +473,7 @@ def compute_full_view_belief(
     occlusion_far_ratio: float = 0.985,
 ) -> dict[str, torch.Tensor]:
     """
-    Tính belief(j) đầy đủ cho một view (real hoặc mirror): kết hợp b_occ
-    (ray-casting), b_det (ViTPose confidence), b_reproj (reprojection residual).
+    Tính source reliability cố định và giữ b_occ trong diagnostics.
 
     joints_3d_view, vertices_view : hệ tọa độ "incam" của CHÍNH view này (mục 1/2).
     projected_2d, valid_mask      : joints_3d_view chiếu xuống ảnh qua K của view này.
@@ -498,11 +484,10 @@ def compute_full_view_belief(
     )
     b_det = compute_detection_belief(kp2d_conf)
     b_reproj = compute_reprojection_belief(projected_2d, kp2d_detected, valid_mask, sigma=reproj_sigma)
-    visibility = combine_view_belief(b_occ, b_det, b_reproj, method=combine_method)
-    # Visibility alone cannot validate a detection or its 3D estimate. Internal
-    # skeleton joints also intersect their own skin, so ray casting is uncertain
-    # evidence, not a veto on a confident independent 2D observation.
-    belief = b_det * b_reproj * (0.25 + 0.75 * visibility)
+    # Joint centres are inside the body mesh, so their rays hit skin even when
+    # the corresponding 2D landmark is visible. Keep b_occ for diagnostics only.
+    # b_det and b_reproj appear exactly once (no DS + multiplication double count).
+    belief = b_det * b_reproj
     return {
         "belief": belief,
         "b_occ": b_occ,

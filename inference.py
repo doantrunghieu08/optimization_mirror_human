@@ -95,7 +95,7 @@ def run_inference(config, bypass_refit: bool = False) -> str:
     # Keep real shape by default so pose refinement has an unchanged baseline.
     betas_all = real_data["smpl_params_incam"]["betas"]
     betas_mirror_all = mirror_data["smpl_params_incam"]["betas"]
-    beta_mode = config.get("data", {}).get("beta_mode", "per_frame")
+    beta_mode = config.get("data", {}).get("beta_mode", "median")
     beta_source = config.get("data", {}).get("beta_source", "real")
     if beta_source not in {"real", "both"}:
         raise ValueError("beta_source must be 'real' or 'both'")
@@ -197,7 +197,7 @@ def run_inference(config, bypass_refit: bool = False) -> str:
             kp2d_real=kp2d_real, kp2d_conf_real=kp_conf_real, K_real=K_real,
             kp2d_mirror=kp2d_mirror, kp2d_conf_mirror=kp_conf_mirror, K_mirror=K_mirror,
             smpl=smpl,
-            mirror_betas=betas_mirror_frames.to(device),
+            mirror_betas=betas,
             frame_rate=config.get("data", {}).get("frame_rate", 30.0),
             outer_iterations=refit_cfg.get("outer_iterations", 3),
             inner_steps=refit_cfg.get("inner_steps", 150),
@@ -210,6 +210,7 @@ def run_inference(config, bypass_refit: bool = False) -> str:
             occlusion_far_ratio=refit_cfg.get("occlusion_far_ratio", 0.985),
             post_smooth=refit_cfg.get("post_smooth", False),
             preserve_real_projection=refit_cfg.get("preserve_real_projection", True),
+            acceptance_temporal_tolerance=refit_cfg.get("acceptance_temporal_tolerance", 1.05),
         )
         fused_go, fused_bp = result["global_orient"], result["body_pose"]
         diagnostics = result["diagnostics"]

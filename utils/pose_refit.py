@@ -27,7 +27,12 @@ from utils.belief_fusion import (
     smooth_belief_temporal,
 )
 from utils.camera_utils import calculate_reprojection_loss, project_3d_to_2d
-from utils.geometry import axis_angle_to_quaternion, rotation_geodesic_loss, transfer_orientation
+from utils.geometry import (
+    axis_angle_to_quaternion,
+    quaternion_multiply,
+    quaternion_to_axis_angle,
+    rotation_geodesic_loss,
+)
 from utils.penetration import compute_penetration_loss
 from utils.smpl_utils import SMPLForwardPass, mirror_axis_angle, remirror_body_pose
 from losses.prior_losses import (
@@ -64,20 +69,20 @@ DEFAULT_LOSS_WEIGHTS = {
     "w_pose_accel": 2.0,
     "w_anatomical": 1.5,
     "w_elbow": 1.2,
-    "w_head_collision": 1.0,
+    "w_head_collision": 0.0,
     "w_symmetry": 0.5,
     "w_bone_stability": 0.5,
     "w_temporal": 1.0,
     "w_pose_temporal": 3.0,
     "temporal_confidence_min_weight": 0.5,
-    "w_penetration": 0.25,
+    "w_penetration": 0.0,
     "w_anchor": 0.30,
-    "w_spine_twist": 2.5,
-    "w_hip_split": 1.0,
-    "w_leg_crossing": 3.0,
-    "w_hip_adduction": 2.0,
-    "w_shoulder_hyper": 1.0,
-    "w_wrist_bend": 0.8,
+    "w_spine_twist": 0.0,
+    "w_hip_split": 0.0,
+    "w_leg_crossing": 0.0,
+    "w_hip_adduction": 0.0,
+    "w_shoulder_hyper": 0.0,
+    "w_wrist_bend": 0.0,
     "penetration_radius": 0.10,
     "penetration_sharpness": 30.0,
     "grad_clip_go": 0.5,
@@ -106,6 +111,64 @@ def _mean_rotation_change_deg(go_a: torch.Tensor, bp_a: torch.Tensor, go_b: torc
     return angle_deg.mean().item()
 
 
+def _quaternion_inverse(q: torch.Tensor) -> torch.Tensor:
+    conjugate = q * q.new_tensor([1.0, -1.0, -1.0, -1.0])
+    return conjugate / q.square().sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+@torch.no_grad()
+def estimate_fixed_inter_view_rotation(
+    real_go_reference: torch.Tensor,
+    mirror_go_reference: torch.Tensor,
+    frame_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a robust clip-level real-to-mirror quaternion and frame residuals."""
+    source_q = axis_angle_to_quaternion(mirror_axis_angle(real_go_reference))
+    target_q = axis_angle_to_quaternion(mirror_go_reference)
+    relative = quaternion_multiply(target_q, _quaternion_inverse(source_q))
+    relative = relative / relative.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    weights = (
+        torch.ones(len(relative), device=relative.device, dtype=relative.dtype)
+        if frame_weights is None
+        else frame_weights.to(device=relative.device, dtype=relative.dtype)
+    )
+    valid = torch.isfinite(relative).all(-1) & torch.isfinite(weights) & (weights > 0)
+    if not valid.any():
+        valid = torch.isfinite(relative).all(-1)
+        weights = torch.ones_like(weights)
+    if not valid.any():
+        raise ValueError("Cannot estimate inter-view rotation from non-finite references")
+
+    selected = relative[valid]
+    selected_weights = weights[valid]
+    anchor = selected[0]
+    selected = torch.where((selected * anchor).sum(-1, keepdim=True) < 0, -selected, selected)
+    pairwise = torch.rad2deg(
+        2.0 * torch.acos(
+            (selected[:, None] * selected[None, :]).sum(-1).abs().clamp(max=1.0 - 1e-7)
+        )
+    )
+    fixed = selected[(pairwise * selected_weights[None, :]).sum(-1).argmin()]
+    residual = torch.rad2deg(
+        2.0 * torch.acos((relative * fixed).sum(-1).abs().clamp(max=1.0 - 1e-7))
+    )
+    return fixed, residual
+
+
+@torch.no_grad()
+def _rotation_velocity_deg(global_orient: torch.Tensor, body_pose: torch.Tensor) -> torch.Tensor:
+    """Mean and p95 inter-frame joint rotation in degrees."""
+    if len(global_orient) < 2:
+        return global_orient.new_zeros(2)
+    pose = torch.cat([global_orient[:, None], body_pose.view(len(body_pose), 21, 3)], dim=1)
+    q = axis_angle_to_quaternion(pose)
+    velocity = torch.rad2deg(
+        2.0 * torch.acos((q[1:] * q[:-1]).sum(-1).abs().clamp(max=1.0 - 1e-7))
+    )
+    return torch.stack([velocity.mean(), torch.quantile(velocity.flatten(), 0.95)])
+
+
 def _forward_view_joints_and_mesh(
     smpl: SMPLForwardPass,
     global_orient: torch.Tensor,
@@ -123,19 +186,20 @@ def _to_mirror_frame(
     mirror_normal: torch.Tensor | None = None,
     real_go_reference: torch.Tensor | None = None,
     mirror_go_reference: torch.Tensor | None = None,
+    inter_view_rotation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chuyển pose hiện tại (hệ real) sang hệ tọa độ gốc của ảnh gương.
     Nếu mirror_normal được cung cấp, sử dụng Householder reflection cho arbitrary mirror plane."""
     N = body_pose.shape[0]
     mirrored_bp = remirror_body_pose(body_pose.view(N, 21, 3)).reshape(N, 63)
-    if real_go_reference is not None and mirror_go_reference is not None:
-        # Estimate only the inter-view rotation from the original root pair.
-        # This preserves the raw mirror camera at initialization and propagates
-        # root updates consistently in both the belief and reprojection passes.
-        mirrored_go = transfer_orientation(
-            mirror_axis_angle(real_go_reference), mirror_go_reference,
-            mirror_axis_angle(global_orient),
+    if inter_view_rotation is None and real_go_reference is not None and mirror_go_reference is not None:
+        inter_view_rotation, _ = estimate_fixed_inter_view_rotation(
+            real_go_reference, mirror_go_reference
         )
+    if inter_view_rotation is not None:
+        fixed = inter_view_rotation.reshape(1, 4).expand(N, -1)
+        source_q = axis_angle_to_quaternion(mirror_axis_angle(global_orient))
+        mirrored_go = quaternion_to_axis_angle(quaternion_multiply(fixed, source_q))
     elif mirror_normal is not None:
         from utils.mirror_geometry import reflect_global_orientation
         mirrored_go = reflect_global_orientation(global_orient, mirror_normal)
@@ -206,6 +270,7 @@ def run_pose_refit(
     verbose: bool = True,
     post_smooth: bool = False,
     preserve_real_projection: bool = True,
+    acceptance_temporal_tolerance: float = 1.05,
 ) -> dict[str, torch.Tensor]:
     """Optimize all frames and return parameters plus source/acceptance diagnostics.
 
@@ -229,7 +294,8 @@ def run_pose_refit(
         raise ValueError("Refit requires frames, outer_iterations >= 1 and inner_steps >= 1")
     if not torch.isfinite(torch.tensor(frame_rate)) or frame_rate <= 0:
         raise ValueError("frame_rate must be a finite positive number")
-    mirror_betas = betas if mirror_betas is None else mirror_betas
+    if acceptance_temporal_tolerance < 1.0:
+        raise ValueError("acceptance_temporal_tolerance must be >= 1")
     temporal_scale = float(frame_rate / 30.0)
 
     # Reliability describes each ORIGINAL observation, not the current fused body.
@@ -239,15 +305,32 @@ def run_pose_refit(
         occlusion_near_eps, occlusion_far_ratio,
     )
     belief_mirror_info = _compute_view_belief(
-        smpl, mirror_go_raw, mirror_bp_raw, mirror_betas, mirror_transl_raw,
+        smpl, mirror_go_raw, mirror_bp_raw, betas, mirror_transl_raw,
         kp2d_mirror, kp2d_conf_mirror, K_mirror, reproj_sigma, belief_combine,
         occlusion_near_eps, occlusion_far_ratio,
     )
 
+    root_idxs = [5, 6, 11, 12]
+    frame_confidence = torch.minimum(
+        kp2d_conf_real[:, root_idxs].clamp(0, 1).mean(-1),
+        kp2d_conf_mirror[:, root_idxs].clamp(0, 1).mean(-1),
+    )
+    high_confidence = torch.where(frame_confidence >= 0.5, frame_confidence, torch.zeros_like(frame_confidence))
+    fixed_inter_view_rotation, inter_view_residual = estimate_fixed_inter_view_rotation(
+        real_global_orient,
+        mirror_go_raw,
+        high_confidence if high_confidence.any() else frame_confidence,
+    )
+    inter_view_quality = 1.0 / (1.0 + (inter_view_residual / 30.0).square())
+    source_quality_real = belief_real_info["b_reproj"].detach()
+    source_quality_mirror = belief_mirror_info["b_reproj"].detach() * inter_view_quality[:, None]
+    reprojection_weight_real = kp2d_conf_real.clamp(0, 1).detach() * source_quality_real
+    reprojection_weight_mirror = kp2d_conf_mirror.clamp(0, 1).detach() * source_quality_mirror
+
     @torch.no_grad()
     def projection_errors(go, bp):
         mirror_go, mirror_bp = _to_mirror_frame(
-            go, bp, real_go_reference=real_global_orient, mirror_go_reference=mirror_go_raw,
+            go, bp, inter_view_rotation=fixed_inter_view_rotation,
         )
         scores = []
         for view_go, view_bp, tr, targets, conf, K in (
@@ -263,24 +346,43 @@ def run_pose_refit(
         return torch.stack(scores, dim=-1)
 
     baseline_errors = projection_errors(current_go, current_bp)
+    baseline_view_means = baseline_errors.mean(0)
+    baseline_temporal = _rotation_velocity_deg(current_go, current_bp)
+    score_denominator = torch.cat(
+        [baseline_view_means.clamp_min(1.0), baseline_temporal.clamp_min(1.0)]
+    )
     best_errors = baseline_errors.clone()
     best_go, best_bp = current_go.clone(), current_bp.clone()
+    best_view_means = baseline_view_means.clone()
+    best_temporal = baseline_temporal.clone()
+    best_score = (torch.cat([best_view_means, best_temporal]) / score_denominator).sum()
 
     @torch.no_grad()
     def keep_improvements(go, bp):
-        nonlocal best_go, best_bp, best_errors
+        nonlocal best_go, best_bp, best_errors, best_view_means, best_temporal, best_score
         errors = projection_errors(go, bp)
-        # A fixed detector metric prevents lowering belief to hide a regression.
-        accept = torch.isfinite(errors).all(-1) & (errors <= best_errors + 1e-4).all(-1)
-        accept &= errors.sum(-1) < best_errors.sum(-1)
-        best_go = torch.where(accept[:, None], go.detach(), best_go)
-        best_bp = torch.where(accept[:, None], bp.detach(), best_bp)
-        best_errors = torch.where(accept[:, None], errors, best_errors)
+        view_means = errors.mean(0)
+        temporal = _rotation_velocity_deg(go, bp)
+        score = (torch.cat([view_means, temporal]) / score_denominator).sum()
+        accept = (
+            torch.isfinite(errors).all()
+            and torch.isfinite(temporal).all()
+            and (view_means <= best_view_means + 1e-4).all()
+            and (temporal <= best_temporal * acceptance_temporal_tolerance + 1e-4).all()
+            and score < best_score - 1e-8
+        )
+        if bool(accept):
+            # Accept one coherent sequence; never build a frame-wise pose mosaic.
+            best_go, best_bp = go.detach().clone(), bp.detach().clone()
+            best_errors = errors.clone()
+            best_view_means = view_means.clone()
+            best_temporal = temporal.clone()
+            best_score = score.clone()
         return errors
 
     for outer in range(outer_iterations):
-        belief_real17 = belief_real_info["belief"].clone()
-        belief_mirror17_raw = belief_mirror_info["belief"].clone()
+        belief_real17 = reprojection_weight_real.clone()
+        belief_mirror17_raw = reprojection_weight_mirror.clone()
         belief_mirror17 = flip_coco_belief(belief_mirror17_raw)
         # Làm mượt belief theo thời gian trước khi dùng — occlusion/detection
         # belief tính độc lập mỗi frame nên dễ dao động, gây trọng số fusion/
@@ -343,25 +445,26 @@ def run_pose_refit(
             # Keep all trusted detector constraints. A current mesh's visibility
             # cannot veto them without a circular loss/belief feedback loop.
             loss_reproj_real = calculate_reprojection_loss(
-                proj_real, kp2d_real, kp2d_conf_real.clamp(0, 1), valid_depth_mask=valid_real, sigma=reproj_sigma
+                proj_real, kp2d_real, reprojection_weight_real, valid_depth_mask=valid_real, sigma=reproj_sigma
             )
 
             opt_mirrored_go, opt_mirrored_bp = _to_mirror_frame(
-                opt_go, opt_bp, real_go_reference=real_global_orient, mirror_go_reference=mirror_go_raw,
+                opt_go, opt_bp, inter_view_rotation=fixed_inter_view_rotation,
             )
             joints18_mirror = _forward_view_joints_and_mesh(
                 smpl, opt_mirrored_go, opt_mirrored_bp, betas, mirror_transl_raw, return_mesh=False
             )
             proj_mirror, valid_mirror = project_3d_to_2d(joints18_mirror[:, :17, :], K_mirror)
             loss_reproj_mirror = calculate_reprojection_loss(
-                proj_mirror, kp2d_mirror, kp2d_conf_mirror.clamp(0, 1), valid_depth_mask=valid_mirror, sigma=reproj_sigma
+                proj_mirror, kp2d_mirror, reprojection_weight_mirror, valid_depth_mask=valid_mirror, sigma=reproj_sigma
             )
 
             loss_prior = compute_pose_prior_loss(opt_bp)
             loss_joint_rom = compute_joint_angle_limit_loss(opt_bp)
             loss_anatomical = compute_anatomical_limits_loss(opt_bp)
             loss_elbow = compute_elbow_limits_loss(opt_bp)
-            loss_head = compute_head_collision_loss(joints18_real)
+            zero = joints18_real.new_zeros(())
+            loss_head = compute_head_collision_loss(joints18_real) if w["w_head_collision"] else zero
             loss_symmetry = compute_bone_symmetry_loss(joints18_real[:, :17, :])
             loss_bone_stability = (
                 compute_bone_length_stability_loss(joints18_real[:, :17, :]) if N >= 2 else joints18_real.new_zeros(())
@@ -383,16 +486,27 @@ def run_pose_refit(
                 if N >= 3
                 else joints18_real.new_zeros(())
             )
-            loss_penetration = compute_penetration_loss(
-                joints18_real, radius_m=w["penetration_radius"], sharpness=w["penetration_sharpness"]
+            loss_penetration = (
+                compute_penetration_loss(
+                    joints18_real,
+                    radius_m=w["penetration_radius"],
+                    sharpness=w["penetration_sharpness"],
+                )
+                if w["w_penetration"]
+                else zero
             )
-            # ── Grotesque pose penalties ──────────────────────────────────
-            loss_spine_twist = compute_spine_twist_loss(opt_bp)
-            loss_hip_split = compute_hip_split_loss(opt_bp)
-            loss_leg_crossing = compute_leg_crossing_loss(joints18_real[:, :17, :])
-            loss_hip_adduction = compute_hip_adduction_loss(opt_bp)
-            loss_shoulder_hyper = compute_shoulder_hyperextension_loss(opt_bp)
-            loss_wrist_bend = compute_wrist_bend_loss(opt_bp)
+            loss_spine_twist = compute_spine_twist_loss(opt_bp) if w["w_spine_twist"] else zero
+            loss_hip_split = compute_hip_split_loss(opt_bp) if w["w_hip_split"] else zero
+            loss_leg_crossing = (
+                compute_leg_crossing_loss(joints18_real[:, :17, :])
+                if w["w_leg_crossing"]
+                else zero
+            )
+            loss_hip_adduction = compute_hip_adduction_loss(opt_bp) if w["w_hip_adduction"] else zero
+            loss_shoulder_hyper = (
+                compute_shoulder_hyperextension_loss(opt_bp) if w["w_shoulder_hyper"] else zero
+            )
+            loss_wrist_bend = compute_wrist_bend_loss(opt_bp) if w["w_wrist_bend"] else zero
 
             # Neo cả global_orient (không chỉ body_pose) — thiếu ràng buộc này khiến
             # root rotation không có "điểm tựa" nào ngoài velocity-smoothing
@@ -420,8 +534,8 @@ def run_pose_refit(
                 + w["w_anchor"] * loss_anchor
                 + w["w_spine_twist"] * loss_spine_twist
                 + w["w_hip_split"] * loss_hip_split
-                + w.get("w_leg_crossing", 3.0) * loss_leg_crossing
-                + w.get("w_hip_adduction", 2.0) * loss_hip_adduction
+                + w["w_leg_crossing"] * loss_leg_crossing
+                + w["w_hip_adduction"] * loss_hip_adduction
                 + w["w_shoulder_hyper"] * loss_shoulder_hyper
                 + w["w_wrist_bend"] * loss_wrist_bend
             )
@@ -447,8 +561,11 @@ def run_pose_refit(
             "belief_mirror": belief_mirror17.detach().cpu(),  # real anatomical labels
             "belief_mirror_raw": belief_mirror17_raw.detach().cpu(),
             "fusion_belief_mirror_raw": belief_mirror17_reproj.detach().cpu(),
-            "reprojection_conf_real": kp2d_conf_real.clamp(0, 1).detach().cpu(),
-            "reprojection_conf_mirror": kp2d_conf_mirror.clamp(0, 1).detach().cpu(),
+            "reprojection_conf_real": reprojection_weight_real.cpu(),
+            "reprojection_conf_mirror": reprojection_weight_mirror.cpu(),
+            "source_quality_real": source_quality_real.cpu(),
+            "source_quality_mirror": source_quality_mirror.cpu(),
+            "inter_view_rotation_residual_deg": inter_view_residual.cpu(),
             "bp_quality": bp_quality.detach().cpu(),
         }
         for key in ("b_occ", "b_det", "b_reproj"):
@@ -470,16 +587,21 @@ def run_pose_refit(
         keep_improvements(current_go, current_bp)
         current_go, current_bp = best_go, best_bp
     final_errors = projection_errors(current_go, current_bp)
+    final_temporal = _rotation_velocity_deg(current_go, current_bp)
+    sequence_accepted = bool(
+        ((current_bp - real_body_pose).abs().amax() > 1e-6)
+        or ((current_go - real_global_orient).abs().amax() > 1e-6)
+    )
     diagnostics["reprojection_before_px"] = baseline_errors.cpu()
     diagnostics["reprojection_after_px"] = final_errors.cpu()
-    diagnostics["refit_accepted"] = (
-        ((current_bp - real_body_pose).abs().amax(-1) > 1e-6)
-        | ((current_go - real_global_orient).abs().amax(-1) > 1e-6)
-    ).cpu()
+    diagnostics["rotation_velocity_before_deg"] = baseline_temporal.cpu()
+    diagnostics["rotation_velocity_after_deg"] = final_temporal.cpu()
+    diagnostics["sequence_accepted"] = torch.tensor(sequence_accepted)
+    diagnostics["refit_accepted"] = torch.full((N,), sequence_accepted, dtype=torch.bool)
     if verbose:
         print(f"[pose_refit] reprojection real/mirror px: "
               f"{baseline_errors.mean(0).tolist()} -> {final_errors.mean(0).tolist()}; "
-              f"accepted {int(diagnostics['refit_accepted'].sum())}/{N} frames")
+              f"sequence accepted={sequence_accepted}")
 
     return {
         "global_orient": current_go,

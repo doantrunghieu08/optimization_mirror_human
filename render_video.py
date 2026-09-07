@@ -265,18 +265,18 @@ def render_video(config: dict, pkl_path: str, input_video: str, output_video: st
             if "belief_mirror" in results:
                 belief_mirror_frame = results["belief_mirror"][frame_idx]
 
-            # Vẽ 2D keypoints từ ViTPose gốc (nếu có) làm mirror reference
-            mirror_2d_np = None
+            # ViTPose của real view; đây không phải projection/detection mirror.
+            detected_real_2d = None
             if "kp2d_real" in results:
-                mirror_2d_np = results["kp2d_real"][frame_idx]  # (17, 2)
+                detected_real_2d = results["kp2d_real"][frame_idx]  # (17, 2)
 
             panel2 = _draw_dual_2d_skeleton(
                 frame.copy(), proj_real_np,
-                joints_2d_mirror=mirror_2d_np,
+                joints_2d_mirror=detected_real_2d,
                 belief_real=belief_real_frame,
                 belief_mirror=belief_mirror_frame,
             )
-            cv2.putText(panel2, "Projection: Green=Fused, Blue=ViTPose", (20, 40),
+            cv2.putText(panel2, "Real view: Green=Fused, Blue=Detected real 2D", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             # Legend cho màu khớp
             cv2.putText(panel2, "Red=Low trust  Yellow=Mirror evidence", (20, 70),

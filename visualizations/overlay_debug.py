@@ -62,7 +62,7 @@ def main(config: dict) -> None:
         is_train=True,
         train_ratio=1.0,
         gt_dir=data_cfg.get("gt_dir"),
-        image_width=data_cfg.get("image_width", 1920),
+        image_width=data_cfg.get("image_width"),
         mirror_intrinsics_mode=data_cfg.get("mirror_intrinsics_mode", "raw"),
         beta_mode=data_cfg.get("beta_mode", "median"),
         allow_missing_vitpose=True,
@@ -101,14 +101,14 @@ def main(config: dict) -> None:
         )
         proj_mirror, _ = project_3d_to_2d(joints_mirror[:, :17], batch["K_mirror"])
 
-        w, h = _canvas_size(sample["K_real"], data_cfg.get("image_width", 1920))
+        w, h = _canvas_size(sample["K_real"], data_cfg.get("image_width"))
         frame = _read_frame(video_path, idx, w, h)
 
         real_smpl = overlay_2d_skeleton(frame.copy(), proj_real[0].detach().cpu(), color=(0, 255, 0))
         real_vp = overlay_2d_skeleton(frame.copy(), sample["kp2d_real"], color=(255, 0, 0))
         real_both = overlay_2d_skeleton(real_smpl, sample["kp2d_real"], color=(255, 0, 0))
 
-        mw, mh = _canvas_size(sample["K_mirror"], data_cfg.get("image_width", 1920))
+        mw, mh = _canvas_size(sample["K_mirror"], data_cfg.get("image_width"))
         mirror_canvas = np.zeros((mh, mw, 3), dtype=np.uint8)
         mir_smpl = overlay_2d_skeleton(mirror_canvas.copy(), proj_mirror[0].detach().cpu(), color=(0, 255, 0))
         mir_both = overlay_2d_skeleton(mir_smpl, sample["kp2d_mirror"], color=(255, 0, 0))

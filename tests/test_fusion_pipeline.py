@@ -113,7 +113,7 @@ class RefitAcceptanceTests(unittest.TestCase):
         torch.testing.assert_close(result['body_pose'], torch.zeros(1, 63), atol=0, rtol=0)
         self.assertFalse(bool(result['diagnostics']['refit_accepted'][0]))
 
-    def test_mirror_evidence_uses_mirror_shape(self):
+    def test_evidence_and_optimization_use_the_same_clip_shape(self):
         seen_betas = []
 
         def evidence(*args, **kwargs):
@@ -135,7 +135,7 @@ class RefitAcceptanceTests(unittest.TestCase):
             )
 
         torch.testing.assert_close(seen_betas[0], torch.zeros(1, 10))
-        torch.testing.assert_close(seen_betas[1], torch.ones(1, 10))
+        torch.testing.assert_close(seen_betas[1], torch.zeros(1, 10))
 
 
 @unittest.skipUnless(Path('models/SMPLX_NEUTRAL.npz').exists()
