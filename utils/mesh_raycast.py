@@ -15,9 +15,8 @@ Quy ước hệ tọa độ:
     mục 2 của tài liệu — chỉ cần dựng mesh riêng cho mỗi view (bằng forward
     kinematics với params của đúng view đó) rồi bắn tia từ gốc tọa độ.
 
-Dùng trimesh làm bộ tăng tốc ray–mesh intersection (không cần pyembree; nếu
-không có pyembree, trimesh tự dùng RayMeshIntersector thuần numpy — vẫn đủ
-nhanh vì mỗi frame chỉ cần bắn 17 tia).
+Dùng trimesh làm bộ tăng tốc ray–mesh intersection. Belief chính dùng các
+vertex bề mặt tạo nên từng COCO landmark, không dùng tâm khớp nằm trong mesh.
 """
 
 from __future__ import annotations
@@ -25,6 +24,67 @@ from __future__ import annotations
 import numpy as np
 import torch
 import trimesh
+
+
+def surface_landmarks_from_regressor(
+    joints_3d: torch.Tensor,
+    vertices: torch.Tensor,
+    regressor: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return actual mesh vertices and weights for each COCO surface landmark."""
+    if regressor is None:
+        # ponytail: legacy SMPL has no COCO surface regressor; replace this
+        # nearest-vertex fallback if that model becomes a production input.
+        indices = torch.cdist(joints_3d, vertices).argmin(dim=-1)
+        points = vertices.gather(1, indices[..., None].expand(-1, -1, 3))
+        return points.unsqueeze(2), joints_3d.new_ones(joints_3d.shape[:2] + (1,))
+
+    positive = regressor.to(device=vertices.device, dtype=vertices.dtype).clamp_min(0)
+    count = int((positive > 0).sum(dim=-1).max().item())
+    weights, indices = positive.topk(max(count, 1), dim=-1)
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    return vertices[:, indices], weights
+
+
+def compute_ray_visibility(
+    surface_points: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    camera_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    surface_eps: float = 0.02,
+    far_ratio: float = 0.985,
+) -> np.ndarray:
+    """Continuous visibility of mesh-surface targets: 1=visible, 0=blocked."""
+    targets = np.asarray(surface_points, dtype=np.float64)
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    origin = np.asarray(camera_origin, dtype=np.float64)
+    directions = targets - origin[None]
+    distances = np.linalg.norm(directions, axis=-1)
+    valid = np.isfinite(directions).all(axis=-1) & (distances > 1e-8)
+    visibility = np.zeros(len(targets), dtype=np.float64)
+    visibility[valid] = 1.0
+    if not valid.any():
+        return visibility
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    valid_indices = np.flatnonzero(valid)
+    locations, ray_indices, _ = mesh.ray.intersects_location(
+        np.repeat(origin[None], len(valid_indices), axis=0),
+        directions[valid] / distances[valid, None],
+        multiple_hits=False,
+    )
+    if len(locations) == 0:
+        return visibility
+
+    hit_distances = np.linalg.norm(locations - origin[None], axis=-1)
+    first_hit = np.full(len(valid_indices), np.inf)
+    first_hit[ray_indices] = hit_distances
+    target_distances = distances[valid]
+    gap = target_distances - first_hit
+    softness = np.maximum(target_distances * (1.0 - far_ratio), 1e-6)
+    visibility[valid_indices] = 1.0 - np.clip((gap - surface_eps) / softness, 0.0, 1.0)
+    return visibility
 
 
 def compute_ray_occlusion(
@@ -89,24 +149,28 @@ def compute_ray_occlusion(
 
 
 def compute_occlusion_belief_batch(
-    joints_3d: torch.Tensor,
+    surface_landmarks: torch.Tensor,
     vertices: torch.Tensor,
     faces: np.ndarray | torch.Tensor,
+    surface_weights: torch.Tensor | None = None,
     camera_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
     near_eps: float = 0.02,
     far_ratio: float = 0.985,
 ) -> torch.Tensor:
-    """
-    b_occ theo batch: 1.0 = visible (không bị che), 0.0 = self-occluded.
+    """Weighted continuous visibility for (B, J, K, 3) surface regions."""
+    if surface_landmarks.ndim == 3:
+        surface_landmarks = surface_landmarks.unsqueeze(2)
+    if surface_weights is None:
+        surface_weights = surface_landmarks.new_ones(surface_landmarks.shape[1:3])
 
-    joints_3d : (B, J, 3), vertices : (B, V, 3) — mesh phải dựng từ CÙNG pose
-    (dùng torch.no_grad() phía gọi hàm — ray-casting không khả vi).
-    """
-    joints_np = joints_3d.detach().cpu().numpy()
+    landmarks_np = surface_landmarks.detach().cpu().numpy()
     verts_np = vertices.detach().cpu().numpy()
     faces_np = faces.detach().cpu().numpy() if isinstance(faces, torch.Tensor) else np.asarray(faces)
+    weights_np = surface_weights.detach().cpu().numpy()
+    if weights_np.ndim == 2:
+        weights_np = np.broadcast_to(weights_np[None], landmarks_np.shape[:3])
 
-    B, J, _ = joints_np.shape
+    B, J, _, _ = landmarks_np.shape
     belief = np.ones((B, J), dtype=np.float32)
     frame_range = range(B)
     if B > 20:
@@ -116,10 +180,18 @@ def compute_occlusion_belief_batch(
         except ImportError:
             pass
     for b in frame_range:
-        occluded = compute_ray_occlusion(
-            joints_np[b], verts_np[b], faces_np,
-            camera_origin=camera_origin, near_eps=near_eps, far_ratio=far_ratio,
+        active = weights_np[b] > 0
+        point_visibility = compute_ray_visibility(
+            landmarks_np[b][active], verts_np[b], faces_np,
+            camera_origin=camera_origin, surface_eps=near_eps, far_ratio=far_ratio,
         )
-        belief[b] = 1.0 - occluded.astype(np.float32)
+        visibility = np.zeros_like(weights_np[b], dtype=np.float64)
+        visibility[active] = point_visibility
+        belief[b] = (
+            (visibility * weights_np[b]).sum(axis=-1)
+            / np.maximum(weights_np[b].sum(axis=-1), 1e-8)
+        )
 
-    return torch.from_numpy(belief).to(device=joints_3d.device, dtype=joints_3d.dtype)
+    return torch.from_numpy(belief).to(
+        device=surface_landmarks.device, dtype=surface_landmarks.dtype
+    )

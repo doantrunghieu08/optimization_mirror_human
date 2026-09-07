@@ -19,7 +19,11 @@ from utils.belief_fusion import (
     root_belief,
 )
 from utils.camera_utils import calculate_reprojection_loss, project_3d_to_2d
-from utils.mesh_raycast import compute_ray_occlusion
+from utils.mesh_raycast import (
+    compute_occlusion_belief_batch,
+    compute_ray_occlusion,
+    compute_ray_visibility,
+)
 from utils.mirror_geometry import (
     compute_skeleton_scale_ratio,
     estimate_mirror_normal_robust,
@@ -283,6 +287,25 @@ class MeshRaycastRegressionTests(unittest.TestCase):
         joints = np.array([[5.0, 5.0, 6.0]])
         occluded = compute_ray_occlusion(joints, vertices, faces)
         self.assertFalse(bool(occluded[0]))
+
+    def test_surface_front_is_visible_and_back_is_occluded(self):
+        vertices, faces = self._cube_mesh()
+        visibility = compute_ray_visibility(
+            np.array([[0.0, 0.0, 2.0], [0.0, 0.0, 4.0]]),
+            vertices,
+            faces,
+        )
+        self.assertGreater(visibility[0], 0.99)
+        self.assertLess(visibility[1], 0.01)
+
+    def test_surface_region_returns_weighted_continuous_visibility(self):
+        vertices, faces = self._cube_mesh()
+        landmarks = torch.tensor([[[[0.0, 0.0, 2.0], [0.0, 0.0, 4.0]]]])
+        weights = torch.tensor([[0.75, 0.25]])
+        belief = compute_occlusion_belief_batch(
+            landmarks, torch.tensor(vertices)[None], faces, surface_weights=weights
+        )
+        torch.testing.assert_close(belief, torch.tensor([[0.75]]), atol=1e-5, rtol=0)
 
 
 class RenderResourceRegressionTests(unittest.TestCase):

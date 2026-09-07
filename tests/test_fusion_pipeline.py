@@ -12,6 +12,7 @@ from utils.geometry import transfer_orientation
 from utils.mirror_geometry import reflect_global_orientation, unmirror_pose_general
 from utils.pose_refit import DEFAULT_LOSS_WEIGHTS, _to_mirror_frame, run_pose_refit
 from utils.smpl_utils import SMPLForwardPass, unmirror_pose
+from utils.belief_fusion import compute_occlusion_belief
 
 
 class CameraAndEvidenceTests(unittest.TestCase):
@@ -141,6 +142,20 @@ class RefitAcceptanceTests(unittest.TestCase):
 @unittest.skipUnless(Path('models/SMPLX_NEUTRAL.npz').exists()
                      and Path('models/smplx_coco17_J_regressor.pt').exists(), 'SMPL-X assets unavailable')
 class SMPLXBatchingTests(unittest.TestCase):
+    def test_front_shoulders_and_hips_are_not_all_occluded(self):
+        model = SMPLForwardPass('models/SMPLX_NEUTRAL.npz', torch.device('cpu'))
+        joints, vertices, faces = model(
+            torch.zeros(1, 3),
+            torch.zeros(1, 63),
+            torch.zeros(1, 10),
+            torch.tensor([[0.0, 0.0, 3.0]]),
+            return_mesh=True,
+        )
+        belief = compute_occlusion_belief(
+            joints[:, :17], vertices, faces, surface_regressor=model.coco_regressor
+        )
+        self.assertGreater(float(belief[0, [5, 6, 11, 12]].min()), 0.25)
+
     def test_gradients_survive_sequence_chunk_boundary(self):
         model = SMPLForwardPass('models/SMPLX_NEUTRAL.npz', torch.device('cpu'))
         bp = torch.zeros(33, 63, requires_grad=True)

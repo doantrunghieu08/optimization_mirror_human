@@ -28,7 +28,7 @@ def _mock_smpl(global_orient, body_pose, betas, transl, return_mesh=False):
 
 
 class PoseQualityRegressionTests(unittest.TestCase):
-    def test_joint_center_raycast_is_diagnostic_only_and_evidence_is_not_doubled(self):
+    def test_surface_visibility_enters_belief_without_doubling_evidence(self):
         confidence = torch.full((1, 17), 0.8)
         projected = torch.zeros(1, 17, 2)
         detected = torch.zeros_like(projected)
@@ -36,7 +36,7 @@ class PoseQualityRegressionTests(unittest.TestCase):
         valid = torch.ones(1, 17, dtype=torch.bool)
         with patch(
             "utils.belief_fusion.compute_occlusion_belief",
-            return_value=torch.zeros(1, 17),
+            return_value=torch.full((1, 17), 0.25),
         ):
             result = compute_full_view_belief(
                 torch.zeros(1, 17, 3),
@@ -48,9 +48,9 @@ class PoseQualityRegressionTests(unittest.TestCase):
                 valid,
                 reproj_sigma=50,
             )
-        expected = confidence * 0.5
+        expected = 0.25 * confidence * 0.5
         torch.testing.assert_close(result["belief"], expected)
-        self.assertEqual(float(result["b_occ"].sum()), 0)
+        self.assertAlmostEqual(float(result["b_occ"].mean()), 0.25)
 
     def test_fixed_inter_view_rotation_ignores_one_noisy_reference_frame(self):
         real = torch.zeros(5, 3)

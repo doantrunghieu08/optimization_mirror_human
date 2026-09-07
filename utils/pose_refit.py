@@ -1,11 +1,10 @@
 """Refine a shared body pose from independent real/mirror observations.
 
-Source meshes provide visibility and reprojection evidence for a single
-belief-weighted pose anchor. The optimizer uses independent detector confidence
-for its two reprojection losses, plus anatomical and temporal regularization.
+Source meshes provide fixed surface visibility and reprojection evidence for a
+single belief-weighted pose anchor and both reprojection losses.
 Local rotations use canonical body reflection; root updates are transferred
-through the original camera orientation pair. A fixed per-frame projection
-check retains the best pose improving both views, including the real baseline.
+through the original camera orientation pair. A sequence-level projection and
+temporal check retains the best pose improving both views.
 Betas and translations stay fixed. Skinning is chunked without breaking the
 full-sequence temporal objective.
 """
@@ -19,6 +18,7 @@ from utils.belief_fusion import (
     compute_cross_view_trust,
     compute_full_view_belief,
     flip_coco_belief,
+    fuse_global_orient_precision_weighted,
     fuse_pose_precision_weighted,
     map_coco_belief_to_smpl_body,
     map_smpl_body_scale_to_coco,
@@ -77,12 +77,12 @@ DEFAULT_LOSS_WEIGHTS = {
     "temporal_confidence_min_weight": 0.5,
     "w_penetration": 0.0,
     "w_anchor": 0.30,
-    "w_spine_twist": 0.0,
-    "w_hip_split": 0.0,
+    "w_spine_twist": 0.5,
+    "w_hip_split": 0.5,
     "w_leg_crossing": 0.0,
     "w_hip_adduction": 0.0,
-    "w_shoulder_hyper": 0.0,
-    "w_wrist_bend": 0.0,
+    "w_shoulder_hyper": 0.4,
+    "w_wrist_bend": 0.4,
     "penetration_radius": 0.10,
     "penetration_sharpness": 30.0,
     "grad_clip_go": 0.5,
@@ -232,6 +232,7 @@ def _compute_view_belief(
             joints17, vertices, faces,
             kp2d_detected=kp2d, kp2d_conf=kp2d_conf,
             projected_2d=projected_2d, valid_mask=valid_mask,
+            surface_regressor=getattr(smpl, "coco_regressor", None),
             reproj_sigma=reproj_sigma, combine_method=combine_method,
             occlusion_near_eps=occlusion_near_eps, occlusion_far_ratio=occlusion_far_ratio,
         )
@@ -322,10 +323,16 @@ def run_pose_refit(
         high_confidence if high_confidence.any() else frame_confidence,
     )
     inter_view_quality = 1.0 / (1.0 + (inter_view_residual / 30.0).square())
-    source_quality_real = belief_real_info["b_reproj"].detach()
-    source_quality_mirror = belief_mirror_info["b_reproj"].detach() * inter_view_quality[:, None]
-    reprojection_weight_real = kp2d_conf_real.clamp(0, 1).detach() * source_quality_real
-    reprojection_weight_mirror = kp2d_conf_mirror.clamp(0, 1).detach() * source_quality_mirror
+    source_quality_real = (
+        belief_real_info["b_occ"] * belief_real_info["b_reproj"]
+    ).detach()
+    source_quality_mirror = (
+        belief_mirror_info["b_occ"]
+        * belief_mirror_info["b_reproj"]
+        * inter_view_quality[:, None]
+    ).detach()
+    reprojection_weight_real = belief_real_info["b_det"].detach() * source_quality_real
+    reprojection_weight_mirror = belief_mirror_info["b_det"].detach() * source_quality_mirror
 
     @torch.no_grad()
     def projection_errors(go, bp):
@@ -333,15 +340,14 @@ def run_pose_refit(
             go, bp, inter_view_rotation=fixed_inter_view_rotation,
         )
         scores = []
-        for view_go, view_bp, tr, targets, conf, K in (
-            (go, bp, real_transl, kp2d_real, kp2d_conf_real, K_real),
-            (mirror_go, mirror_bp, mirror_transl_raw, kp2d_mirror, kp2d_conf_mirror, K_mirror),
+        for view_go, view_bp, tr, targets, weights, K in (
+            (go, bp, real_transl, kp2d_real, reprojection_weight_real, K_real),
+            (mirror_go, mirror_bp, mirror_transl_raw, kp2d_mirror, reprojection_weight_mirror, K_mirror),
         ):
             joints = smpl(view_go, view_bp, betas, tr)[:, :17]
             xy, valid = project_3d_to_2d(joints, K)
             error = (xy - targets).norm(dim=-1)
             error = torch.where(valid & torch.isfinite(error), error, torch.full_like(error, 1e6))
-            weights = conf.clamp(0.0, 1.0)
             scores.append((error * weights).sum(-1) / weights.sum(-1).clamp_min(1e-8))
         return torch.stack(scores, dim=-1)
 
@@ -367,7 +373,6 @@ def run_pose_refit(
         accept = (
             torch.isfinite(errors).all()
             and torch.isfinite(temporal).all()
-            and (view_means <= best_view_means + 1e-4).all()
             and (temporal <= best_temporal * acceptance_temporal_tolerance + 1e-4).all()
             and score < best_score - 1e-8
         )
@@ -424,8 +429,11 @@ def run_pose_refit(
             belief21_real, belief21_mirror,
         ).reshape(N, 63)
 
-        # Fuse once: a second blend overweights the mirror (50/50 becomes 25/75).
-        fused_go_ref = real_global_orient
+        root_bel_mirror = root_belief(belief_mirror17)
+        fused_go_ref = fuse_global_orient_precision_weighted(
+            real_global_orient, mirror_global_orient_unmirrored,
+            root_bel_real, root_bel_mirror,
+        )
         init_go, init_bp = current_go, current_bp
         opt_go = init_go.clone().detach().requires_grad_(True)
         opt_bp = init_bp.clone().detach().requires_grad_(True)
@@ -442,8 +450,8 @@ def run_pose_refit(
 
             joints18_real = _forward_view_joints_and_mesh(smpl, opt_go, opt_bp, betas, real_transl, return_mesh=False)
             proj_real, valid_real = project_3d_to_2d(joints18_real[:, :17, :], K_real)
-            # Keep all trusted detector constraints. A current mesh's visibility
-            # cannot veto them without a circular loss/belief feedback loop.
+            # Visibility is fixed from the source mesh, so it can gate an
+            # occluded detector constraint without candidate-dependent feedback.
             loss_reproj_real = calculate_reprojection_loss(
                 proj_real, kp2d_real, reprojection_weight_real, valid_depth_mask=valid_real, sigma=reproj_sigma
             )

@@ -13,19 +13,19 @@ data:
 model:
   smpl_model_path: "models/SMPLX_NEUTRAL.npz"  # GVHMR predicts SMPL-X parameters
 
-# ── Ray-casting occlusion + Belief theory (Dempster-Shafer) + SMPLify-style
+# ── Surface-landmark visibility + evidence-weighted SMPLify-style refit
 #    iterative refit — xem HuongTiepCanMoi.md và utils/pose_refit.py ─────────
 refit:
   outer_iterations:    3       # Các lượt tối ưu với prior warm-up; evidence nguồn được giữ cố định
   inner_steps:         150     # Số bước Adam mỗi vòng ngoài
   lr:                  0.01    # Giảm từ 0.02 — bước Adam mịn hơn, tránh xoay quá đà 1 step (Bug 6)
   reproj_sigma:        50.0    # Ngưỡng chịu đựng sai số reprojection (px), dùng cho cả loss lẫn b_reproj
-  belief_combine:      "dempster_shafer"  # "dempster_shafer" hoặc "weighted"
+  belief_combine:      "dempster_shafer"  # Legacy API; reliability uses b_occ * b_det * b_reproj.
   convergence_deg:     0.5     # Dừng sớm nếu pose thay đổi < ngưỡng này (độ) giữa 2 vòng ngoài
-  occlusion_near_eps:  0.02    # (m) bỏ qua giao điểm ray-mesh quá gần camera
-  occlusion_far_ratio: 0.985   # bỏ qua giao điểm ray-mesh quá gần chính joint (tự cắt bề mặt da)
+  occlusion_near_eps:  0.02    # (m) tolerance quanh surface landmark trước khi coi là bị chắn
+  occlusion_far_ratio: 0.985   # độ rộng chuyển tiếp visibility theo tỉ lệ khoảng cách camera
   post_smooth: false          # Temporal losses already run inside the refit objective
-  preserve_real_projection: true  # Reject frames that worsen detector-weighted 2D error
+  preserve_real_projection: false  # Allow mirror fusion to adjust pose without hard veto from minor real view 2D error increase
   acceptance_temporal_tolerance: 1.05
 
   loss_weights:
@@ -46,12 +46,12 @@ refit:
     w_penetration:     0.0    # Tắt: skeleton-distance proxy chưa phải mesh collision
     w_anchor:          0.30   # Body neo về pose belief-fused; root neo về real camera
     # ── Grotesque Pose Penalties ──────────────────────────────────────────────
-    w_spine_twist:   0.0
-    w_hip_split:     0.0
+    w_spine_twist:   0.5
+    w_hip_split:     0.5
     w_leg_crossing:  0.0
     w_hip_adduction: 0.0
-    w_shoulder_hyper: 0.0
-    w_wrist_bend:    0.0
+    w_shoulder_hyper: 0.4
+    w_wrist_bend:    0.4
     penetration_radius:    0.10
     penetration_sharpness: 30.0
     grad_clip_go:          0.5   # Clip riêng cho opt_go (3 chiều) — tránh bị opt_bp (63 chiều) lấn át (Bug 6)

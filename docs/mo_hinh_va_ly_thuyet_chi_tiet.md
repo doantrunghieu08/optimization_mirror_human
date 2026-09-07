@@ -1,10 +1,9 @@
 # BÁO CÁO TOÀN DIỆN: LÝ THUYẾT, KIẾN TRÚC MÔ HÌNH VÀ PHƯƠNG PHÁP TRIỂN KHAI
 ## Dự Án Optimization Mirror Human (3D Pose & Mesh Fusion from Real + Mirror Views)
 
-> **Tài liệu lịch sử, không phải đặc tả implementation hiện tại.** Pipeline đang chạy dùng
-> phản xạ giải phẫu canonical và chuyển root giữa hai camera; không dùng ước lượng gương
-> bất kỳ, scale normalization hay hậu xử lý smoothing mặc định. Cấu hình trong
-> `configs/default.yaml` và code trong `utils/pose_refit.py` là nguồn sự thật.
+> **Tài liệu tham khảo lịch sử.** Xem báo cáo cập nhật đầy đủ và chính xác nhất tại
+> [docs/bao_cao_ly_thuyet_va_kien_truc_dst_fusion.md](file:///d:/optimization_mirror_human/docs/bao_cao_ly_thuyet_va_kien_truc_dst_fusion.md).
+> Cấu hình trong `configs/default.yaml`, `utils/belief_fusion.py` và `utils/pose_refit.py` là nguồn sự thật cài đặt.
 
 Tài liệu này trình bày chi tiết và hệ thống toàn bộ cơ sở lý thuyết toán học, các mô hình hình học, lý thuyết niềm tin Dempster-Shafer, quy tắc biến đổi trên nhóm Lie $SO(3)$, phép phản xạ Householder cho vị trí gương bất kỳ, các ràng buộc sinh lý học động học cơ thể, cùng kiến trúc mã nguồn và luồng triển khai trong dự án **Optimization Mirror Human**.
 

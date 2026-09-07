@@ -1,8 +1,8 @@
 """
 inference.py
 ============
-Pipeline: ray-casting occlusion + belief theory (Dempster-Shafer) + SMPLify-style
-iterative pose refit (xem utils/pose_refit.py).
+Pipeline: surface-landmark ray-casting + evidence-weighted SMPLify-style pose
+refit (xem utils/pose_refit.py).
 
 Đầu ra: file .pkl chứa SMPL params cho mỗi frame — CÙNG schema với trước, để
 tương thích render_video.py / evaluate.py.
@@ -29,7 +29,7 @@ from utils.geometry import transfer_orientation
 
 def run_inference(config, bypass_refit: bool = False) -> str:
     """
-    Chạy pipeline belief-theory refit trên toàn bộ sequence và lưu kết quả ra file PKL.
+    Chạy surface-visibility refit trên toàn bộ sequence và lưu kết quả ra file PKL.
 
     Args:
         config        : dict config từ YAML.
@@ -181,7 +181,7 @@ def run_inference(config, bypass_refit: bool = False) -> str:
         fused_go_global = global_go
     else:
         refit_cfg = config.get("refit", {})
-        print(f"Running belief-theory refit on {n_frames} frames "
+        print(f"Running surface-visibility refit on {n_frames} frames "
               f"(outer_iterations={refit_cfg.get('outer_iterations', 3)}, "
               f"inner_steps={refit_cfg.get('inner_steps', 150)})...")
         result = run_pose_refit(
@@ -255,7 +255,7 @@ def run_inference(config, bypass_refit: bool = False) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Belief-theory occlusion fusion + SMPLify-style refit — chỉ suy luận, không render video."
+        description="Surface-visibility fusion + SMPLify-style refit — chỉ suy luận, không render video."
     )
     parser.add_argument("--config",        type=str, default="configs/default.yaml")
     parser.add_argument("--bypass_refit",  action="store_true",

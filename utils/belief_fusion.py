@@ -1,9 +1,8 @@
 """Belief/reliability helpers for real and mirror observations.
 
-Optimizer reliability is b_det * b_reproj from the original observation.
-Joint-centre ray casting remains in b_occ diagnostics only because internal
-anatomical joints intersect the skin even when their 2D landmarks are visible.
-The older combination helpers remain callable for diagnostics and compatibility.
+Optimizer reliability is b_occ * b_det * b_reproj from the original
+observation. Ray casting targets the mesh vertices supporting each COCO
+surface landmark, never internal anatomical joint centres.
 
 Sau khi có belief theo khung khớp COCO-17 (17 khớp), belief được ánh xạ sang
 21 khớp body_pose SMPL (axis-angle) để dùng làm trọng số fusion SO(3)
@@ -16,7 +15,10 @@ from __future__ import annotations
 import torch
 
 from utils.geometry import axis_angle_to_quaternion, interpolate_axis_angle
-from utils.mesh_raycast import compute_occlusion_belief_batch
+from utils.mesh_raycast import (
+    compute_occlusion_belief_batch,
+    surface_landmarks_from_regressor,
+)
 
 # Thứ tự khớp COCO-17, giống configs/keypoints3d_map.yml / keypoints2d_map.yml
 COCO_JOINT_NAMES = [
@@ -103,22 +105,25 @@ def compute_occlusion_belief(
     joints_3d_view: torch.Tensor,
     vertices_view: torch.Tensor,
     faces,
+    surface_regressor: torch.Tensor | None = None,
     camera_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
     near_eps: float = 0.02,
     far_ratio: float = 0.985,
 ) -> torch.Tensor:
     """
-    b_occ: ray-casting trên mesh SMPL của CHÍNH view đó (mục 1 tài liệu).
+    b_occ: ray-casting tới surface region COCO trên mesh của CHÍNH view đó.
 
-    joints_3d_view : (B, 17, 3) — khớp COCO-17, hệ tọa độ "incam" của view này.
-    vertices_view  : (B, 6890, 3) — mesh cùng pose, cùng hệ tọa độ.
-    faces          : (13776, 3).
+    surface_regressor ánh xạ COCO-17 tới các vertex SMPL-X. Với legacy SMPL,
+    landmark bề mặt gần nhất được dùng làm fallback.
 
     Không lan truyền gradient — dùng trong torch.no_grad() ở nơi gọi.
     """
     with torch.no_grad():
+        landmarks, weights = surface_landmarks_from_regressor(
+            joints_3d_view, vertices_view, surface_regressor
+        )
         return compute_occlusion_belief_batch(
-            joints_3d_view, vertices_view, faces,
+            landmarks, vertices_view, faces, surface_weights=weights,
             camera_origin=camera_origin, near_eps=near_eps, far_ratio=far_ratio,
         )
 
@@ -467,27 +472,28 @@ def compute_full_view_belief(
     kp2d_conf: torch.Tensor,
     projected_2d: torch.Tensor,
     valid_mask: torch.Tensor,
+    surface_regressor: torch.Tensor | None = None,
     reproj_sigma: float = 50.0,
     combine_method: str = "dempster_shafer",
     occlusion_near_eps: float = 0.02,
     occlusion_far_ratio: float = 0.985,
 ) -> dict[str, torch.Tensor]:
     """
-    Tính source reliability cố định và giữ b_occ trong diagnostics.
+    Tính source reliability cố định từ surface visibility, detector và reprojection.
 
     joints_3d_view, vertices_view : hệ tọa độ "incam" của CHÍNH view này (mục 1/2).
     projected_2d, valid_mask      : joints_3d_view chiếu xuống ảnh qua K của view này.
     """
     b_occ = compute_occlusion_belief(
         joints_3d_view, vertices_view, faces,
+        surface_regressor=surface_regressor,
         near_eps=occlusion_near_eps, far_ratio=occlusion_far_ratio,
     )
     b_det = compute_detection_belief(kp2d_conf)
     b_reproj = compute_reprojection_belief(projected_2d, kp2d_detected, valid_mask, sigma=reproj_sigma)
-    # Joint centres are inside the body mesh, so their rays hit skin even when
-    # the corresponding 2D landmark is visible. Keep b_occ for diagnostics only.
-    # b_det and b_reproj appear exactly once (no DS + multiplication double count).
-    belief = b_det * b_reproj
+    # Independent evidence appears exactly once; low surface visibility lets
+    # the other camera drive fusion/refit instead of trusting an occluded view.
+    belief = b_occ * b_det * b_reproj
     return {
         "belief": belief,
         "b_occ": b_occ,
